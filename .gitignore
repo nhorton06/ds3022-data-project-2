@@ -1,3 +1,18 @@
 storage*
 github*
 CLAUDE.md
+
+# data and local database
+data/
+*.duckdb
+*.duckdb.wal
+
+# environment and secrets
+.venv/
+.env
+
+# python / dbt build output
+__pycache__/
+target/
+logs/
+dbt_packages/

@@ -57,7 +57,8 @@ export GH_PAT=<your token>
 <!--
 - Run command: python main.py  (optionally `time python main.py` to measure runtime)
 - Expected runtime: full first run ~65 min (about 7,950 requests; one ~22 min rate-limit sleep
-  because the 5,000/hour limit is exceeded). Incremental runs: fill in after Task 2.
+  because the 5,000/hour limit is exceeded). Incremental runs (after the first full run): ~38 s,
+  105 requests when run two days later; scales with how much activity happened since the last run.
 - Where output goes: data/raw/, packages.duckdb, logs/, plots/
 -->
 The flow can be run by executing the command `python main.py` or `time python main.py` to include the time metrics for
@@ -154,14 +155,110 @@ Following this sleep, it then resumed right where it left off until it finished 
 | Interrupted run | ~447 | 3m 52s |
 | Resumed run | 7,501 | 61m 16s |
 | Full first run total | ~7,950 | ~65 min |
-| Incremental run | (after Task 2) | |
+| Incremental run | 105 | ~38s |
 
 ## Task 2: Load
 
 <!--
-Fill in after Task 2: raw table design, upsert on (repo, id), _load_state + _LOADED marker,
-row counts from loading the same files twice, request count for an incremental run.
+How it works (in your own words):
+- Code: pipeline/load.py, task load(), runs right after extract() in main.py. Reads only data/raw/, never calls the API.
+- Raw tables: one per endpoint (raw_commits, raw_pull_requests, raw_pr_reviews, raw_releases), one row per record.
+  Columns: repo, id, updated_at, fetched_at (from the landing file), source_file (path of the page file), payload (full
+  record as JSON). PRIMARY KEY (repo, id). Natural keys: commits -> sha, PRs -> number, reviews/releases -> id.
+- updated_at mapping (only PRs have a real updated_at, so each endpoint uses its closest timestamp):
+  PRs -> updated_at, commits -> commit.committer.date (same date GitHub's `since` filter uses),
+  reviews -> submitted_at, releases -> published_at (NULL for drafts).
+- Loading: DuckDB read_json() reads every page file for an endpoint at once; unnest(data) turns each page into one row per
+  record; ->> pulls fields out of the JSON and :: casts them to BIGINT/TIMESTAMP. Payload is kept unchanged.
+- Idempotency: INSERT OR REPLACE upserts on (repo, id), so loading the same files twice never adds duplicates.
+  QUALIFY row_number() keeps only the newest copy if the same record appears twice in one batch (e.g. a PR that
+  shifted between pages while paging).
+- _load_state: one row per repo + endpoint with max(updated_at) and loaded_at. Written only after all four tables load,
+  then data/raw/_LOADED is created. Next run, Task 1 sees _LOADED -> deletes data/raw/ and uses the _load_state
+  watermarks as `since` / the pulls stop point. If a load crashes partway there is no marker, so the next run resumes
+  and simply reloads (safe because of the upsert).
+- Known limitation (optional): commits are filtered by committer date, so commits created before the watermark but
+  pushed after it would be missed. Rare, since GitHub's merge/squash buttons create a new commit date.
+
+Evidence to include:
+- Loading twice on the same files (logs/load.log), rows before -> after:
+    raw_commits:       load 1: 0 -> 11,388 | load 2: 11,388 -> 11,388
+    raw_pull_requests: load 1: 0 -> 8,300  | load 2: 8,300 -> 8,300
+    raw_pr_reviews:    load 1: 0 -> 15,513 | load 2: 15,513 -> 15,513
+    raw_releases:      load 1: 0 -> 248    | load 2: 248 -> 248
+- Incremental run (full flow, ~38 s, 105 API requests vs ~7,950 / ~65 min for the full run):
+    raw_commits:        94 records fetched | 11,388 -> 11,479
+    raw_pull_requests: 300 records fetched |  8,300 -> 8,345
+    raw_pr_reviews:     52 records fetched | 15,513 -> 15,531
+    raw_releases:      248 records fetched |    248 -> 248 (always fetched in full)
+  Why fewer new rows than records fetched: most fetched PRs already existed and were updated in place; 3 commits
+  were the watermark commits themselves (GitHub's `since` includes the boundary), replaced rather than duplicated.
+- Log lines worth quoting:
+    Found _LOADED: previous data is in DuckDB, deleting data/raw/ and fetching only new records
+    numpy/numpy: commits since 2026-10-23T19:54:06Z, pulls since 2026-10-23T20:41:59Z
+    Extract finished: 105 API requests this run
+    raw_pull_requests: 300 records in files, 300 unique, rows before 8300 -> after 8345
 -->
+Task 2's code is in the pipeline folder under `load.py`. It also includes the `load()` task in the flow, and it runs
+directly after the `extract()` task in main.py. It just reads the data from the raw folder created in task 1, not calling
+the API, only reading from the outputs from task 1. It creates raw tables, one for each endpoint, and creates a single
+row per record. Each table has the `repo`, `id`, `updated_at`, `fetched_at`, `source_file`, `payload`, and a primary key using the
+repo and id combined, as requested in the instructions. The `id` column stores the record's natural key (sha for
+commits, number for pull requests, id for reviews/releases). An issue that came up is that only pull requests have a
+real `updated_at` time, so the way around this was to use committer date for commits, `submitted_at` for reviews, and
+`published_at` for releases.
+
+For loading the data itself, I used DuckDB's `read_json()` command to read all the pages for an endpoint at the same
+time, turning each page into one row per record using `unnest`. I also pulled out specific fields using DuckDB's `->>`
+out of the JSON and cast them as specific data types with `::BIGINT` and `::TIMESTAMP`.
+
+For idempotency, each table is created with `CREATE TABLE IF NOT EXISTS`, preventing duplicate table creation and so
+later runs can reuse the same tables. Rows are added with `INSERT OR REPLACE` so if a row already exists with the unique
+identifier, it'll replace it, and otherwise the row is just inserted into the table. This ensures no duplicates will be
+written.
+
+`_load_state` stores one row per repo per endpoint with the newest `updated_at` loaded, only writing after all the
+tables have loaded, and then the `_LOADED` marker is made. On following runs, task 1 sees said marker and will delete
+the raw data folder since it's all in DuckDB and use the watermark to fetch only new records. If loads crash, there's no
+marker, so next runs resume and reload the files.
+
+Before inserting the data, the QUALIFY statement keeps only the newest copy of a record if the same record appears more
+than once in a batch.
+
+### Loading the same files twice (idempotency)
+
+Row counts from running Task 2 twice on the same landed files (`logs/load.log`):
+
+| Table | Load 1 (before → after) | Load 2 (before → after) |
+| --- | --- | --- |
+| `raw_commits` | 0 → 11,388 | 11,388 → 11,388 |
+| `raw_pull_requests` | 0 → 8,300 | 8,300 → 8,300 |
+| `raw_pr_reviews` | 0 → 15,513 | 15,513 → 15,513 |
+| `raw_releases` | 0 → 248 | 248 → 248 |
+
+### Incremental run
+
+A 2nd full run of the flow 2 days later properly found `_LOADED`, deleted the raw files, fetched only records created or
+updated since the last run using the `_load_state` watermarks, taking 38 seconds for 105 API requests compared to 65
+minutes for about 7950 requests from the first run.
+
+| Table | Records fetched | Rows before → after |
+| --- | --- | --- |
+| `raw_commits` | 94 | 11,388 → 11,479 |
+| `raw_pull_requests` | 300 | 8,300 → 8,345 |
+| `raw_pr_reviews` | 52 | 15,513 → 15,531 |
+| `raw_releases` | 248 | 248 → 248 |
+
+Fewer rows were added than records fetched because most of the pull requests already existed and were updated in place.
+Releases are always fetched in full, so all 248 were replaced with no new rows. 3 commits were the watermark commits
+themselves (GitHub's `since` includes the boundary time), so the upsert replaced them rather than duplicating them.
+
+```
+14:14:44 | INFO | Found _LOADED: previous data is in DuckDB, deleting data/raw/ and fetching only new records
+14:14:44 | INFO | numpy/numpy: commits since 2026-10-23T19:54:06Z, pulls since 2026-10-23T20:41:59Z
+14:15:15 | INFO | Extract finished: 105 API requests this run
+14:15:16 | INFO | raw_pull_requests: 300 records in files, 300 unique, rows before 8300 -> after 8345
+```
 
 ## Task 3: dbt models and tests
 

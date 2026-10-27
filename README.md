@@ -1,11 +1,5 @@
 # Open Source Package Health: GitHub Data Pipeline
 
-<!--
-One or two sentences: what this project does and which packages it compares.
-Package set A: numpy/numpy, networkx/networkx, statsmodels/statsmodels.
-Analysis window: 2024-01-01 through the time of each run.
-Assignment instructions live in INSTRUCTIONS.md; the submission checklist is CHECKLIST.md.
--->
 This project is pulling data from three different GitHub repositories, each for a Python package.
 It will be using package set A, which will include numpy, networkx, and statsmodels. It will be pulling these repositories
 page by page, and comparing various metrics. The analysis window of the pages pulled will start from the beginning of
@@ -13,14 +7,6 @@ page by page, and comparing various metrics. The analysis window of the pages pu
 
 ## Pipeline overview
 
-<!--
-Short description of the six Prefect tasks and what each one produces:
-1 Extract (GitHub API -> data/raw/*.json), 2 Load (-> packages.duckdb raw_* tables),
-3 dbt build (staging, fact, mart models + tests), 4 Validation (Python checks),
-5 Model (health scores + ranking), 6 Plot (PNGs in plots/).
-Optional: a list of where the code lives (main.py = the flow, pipeline/<task>.py = each task,
-models/ = dbt, plots/ = output, logs/ = per-task log files).
--->
 The first Prefect task will be extracting commits, pull requests, PR reviews, and releases in pages of 100, using the API on
 GitHub to pull these individual pages. It will utilize error handling, retries and resuming, logging, and checkpointing.
 The second task will be loading this data into DuckDB tables, formatting them, allowing for SQL queries, establishing keys.
@@ -34,12 +20,6 @@ and log files per task being in the logs folder.
 
 ## Setup
 
-<!--
-Steps someone would follow from a clean clone:
-- Python version (3.12) and how to create the environment (uv venv + install from requirements.txt)
-- Set the GitHub token: export GH_PAT=... (a classic PAT with no scopes is enough for public repos)
-- Mention that the token is only read from the environment and never stored in the repo
--->
 To create an environment that will properly run this pipeline, you should be using Python 3.12, create a virtual environment
 using `uv venv` and install dependencies from `requirements.txt`. Set the GitHub personal access token to the environment
 variable name GH_PAT. The token is only read from the environment itself and is never written to the repository or the logs themselves.
@@ -54,13 +34,6 @@ export GH_PAT=<your token>
 
 ## Running the flow
 
-<!--
-- Run command: python main.py  (optionally `time python main.py` to measure runtime)
-- Expected runtime: full first run ~65 min (about 7,950 requests; one ~22 min rate-limit sleep
-  because the 5,000/hour limit is exceeded). Incremental runs (after the first full run): ~38 s,
-  105 requests when run two days later; scales with how much activity happened since the last run.
-- Where output goes: data/raw/, packages.duckdb, logs/, plots/
--->
 The flow can be run by executing the command `python main.py` or `time python main.py` to include the time metrics for
 running the flow itself on top of the outputs the pipeline already provides. The expected runtime for the first full run for
 task 1 is a little over an hour (about 65 minutes or so, but it can slightly vary depending on when the flow is run during
@@ -68,30 +41,6 @@ the cycle of rate-limit resets of the hour and such). Task 1 writes to the `data
 `packages.duckdb` and the `plots/` folder, and all tasks log to the `logs/` folder.
 
 ## Task 1: Extract
-
-<!--
-How it works (in your own words):
-- 4 endpoints per repo: commits (since=window start), pulls (sorted by updated desc, stop once a
-  page ends before the window start), PR reviews (one call per PR created in the window), releases (all).
-- Pagination: follows the Link header rel="next" with per_page=100; one JSON file per page in
-  data/raw/<owner>__<repo>/<endpoint>/page_0001.json (reviews: pr_reviews/pr_<number>_page_0001.json).
-- Rate limit: reads X-RateLimit-Remaining / X-RateLimit-Reset on every response, sleeps until reset
-  when 10 or fewer requests remain. 403/429 honor Retry-After; 5xx and network errors are retried
-  by Prefect (retries=5, exponential backoff 10/20/40/80/160 s).
-- Resumability: pages already on disk are skipped; the saved next_url continues the chain.
-  Pages are written to a .tmp file then renamed, so a crash never leaves a half-written page.
-
-Evidence to include:
-- Record counts table (from logs/extract.log):
-    numpy:       7,693 commits | 5,800 PRs | 10,557 reviews (5,477 PRs) | 149 releases
-    networkx:      898 commits | 1,400 PRs |  4,168 reviews (1,275 PRs) |  67 releases
-    statsmodels: 2,797 commits | 1,100 PRs |    788 reviews (994 PRs)   |  32 releases
-- Interrupted run log excerpt (Ctrl-C during numpy reviews, 312 review pages saved)
-- Resumed run log excerpt ("No _LOADED marker: resuming", "0 pages fetched, 77 pages already on disk",
-  "5166 pages fetched, 312 pages already on disk")
-- Rate-limit sleep line: "10 requests left in this hour; sleeping 1307s until reset"
-- Request counts: interrupted run ~447, resumed run 7,501 (full-run total ~7,950); incremental: after Task 2
--->
 
 Task 1 uses 4 endpoints for each repo. The first endpoint is the commits, then the pulls, then pull request (PR) reviews, 
 and then releases.
@@ -159,46 +108,6 @@ Following this sleep, it then resumed right where it left off until it finished 
 
 ## Task 2: Load
 
-<!--
-How it works (in your own words):
-- Code: pipeline/load.py, task load(), runs right after extract() in main.py. Reads only data/raw/, never calls the API.
-- Raw tables: one per endpoint (raw_commits, raw_pull_requests, raw_pr_reviews, raw_releases), one row per record.
-  Columns: repo, id, updated_at, fetched_at (from the landing file), source_file (path of the page file), payload (full
-  record as JSON). PRIMARY KEY (repo, id). Natural keys: commits -> sha, PRs -> number, reviews/releases -> id.
-- updated_at mapping (only PRs have a real updated_at, so each endpoint uses its closest timestamp):
-  PRs -> updated_at, commits -> commit.committer.date (same date GitHub's `since` filter uses),
-  reviews -> submitted_at, releases -> published_at (NULL for drafts).
-- Loading: DuckDB read_json() reads every page file for an endpoint at once; unnest(data) turns each page into one row per
-  record; ->> pulls fields out of the JSON and :: casts them to BIGINT/TIMESTAMP. Payload is kept unchanged.
-- Idempotency: INSERT OR REPLACE upserts on (repo, id), so loading the same files twice never adds duplicates.
-  QUALIFY row_number() keeps only the newest copy if the same record appears twice in one batch (e.g. a PR that
-  shifted between pages while paging).
-- _load_state: one row per repo + endpoint with max(updated_at) and loaded_at. Written only after all four tables load,
-  then data/raw/_LOADED is created. Next run, Task 1 sees _LOADED -> deletes data/raw/ and uses the _load_state
-  watermarks as `since` / the pulls stop point. If a load crashes partway there is no marker, so the next run resumes
-  and simply reloads (safe because of the upsert).
-- Known limitation (optional): commits are filtered by committer date, so commits created before the watermark but
-  pushed after it would be missed. Rare, since GitHub's merge/squash buttons create a new commit date.
-
-Evidence to include:
-- Loading twice on the same files (logs/load.log), rows before -> after:
-    raw_commits:       load 1: 0 -> 11,388 | load 2: 11,388 -> 11,388
-    raw_pull_requests: load 1: 0 -> 8,300  | load 2: 8,300 -> 8,300
-    raw_pr_reviews:    load 1: 0 -> 15,513 | load 2: 15,513 -> 15,513
-    raw_releases:      load 1: 0 -> 248    | load 2: 248 -> 248
-- Incremental run (full flow, ~38 s, 105 API requests vs ~7,950 / ~65 min for the full run):
-    raw_commits:        94 records fetched | 11,388 -> 11,479
-    raw_pull_requests: 300 records fetched |  8,300 -> 8,345
-    raw_pr_reviews:     52 records fetched | 15,513 -> 15,531
-    raw_releases:      248 records fetched |    248 -> 248 (always fetched in full)
-  Why fewer new rows than records fetched: most fetched PRs already existed and were updated in place; 3 commits
-  were the watermark commits themselves (GitHub's `since` includes the boundary), replaced rather than duplicated.
-- Log lines worth quoting:
-    Found _LOADED: previous data is in DuckDB, deleting data/raw/ and fetching only new records
-    numpy/numpy: commits since 2026-10-23T19:54:06Z, pulls since 2026-10-23T20:41:59Z
-    Extract finished: 105 API requests this run
-    raw_pull_requests: 300 records in files, 300 unique, rows before 8300 -> after 8345
--->
 Task 2's code is in the pipeline folder under `load.py`. It also includes the `load()` task in the flow, and it runs
 directly after the `extract()` task in main.py. It just reads the data from the raw folder created in task 1, not calling
 the API, only reading from the outputs from task 1. It creates raw tables, one for each endpoint, and creates a single
@@ -262,34 +171,61 @@ themselves (GitHub's `since` includes the boundary time), so the upsert replaced
 
 ## Task 3: dbt models and tests
 
-<!--
-Fill in after Task 3: the bot rule you used, how medians treat PRs still open at run time,
-the models and tests you built.
--->
+Task 3 stores its code in the models, macros, and tests folders. It runs directly from the flow in the
+`pipeline/transform.py` file, uses the `dbt_build()` task in the flow directly after `load()`, and uses PrefectDbtRunner
+to run the `dbt build`. Any failed models or tests raise flags/errors and fail the flow. This is the only spot that dbt
+actually runs. There aren't any retries on purpose because any fails for models or tests is an actual problem that
+should be investigated, not just retried. For logging, it uses dbt's own logs under `logs/dbt.log`, logging the task's
+per-model/test summary into the `transform.log` file and Prefect.
+
+The staging layer uses views and marts use tables. The views are current without any real storage and marts are read
+often by the tasks after this one. Raw tables are declared as a dbt source named raw. Staging has one model per raw
+table (`stg_*`), `fct_pull_requests` and `fct_releases` add the flags and durations, and `mart_repo_monthly` and
+`mart_health_inputs` hold the monthly counts and the health metrics for Task 5.
+
+The bot rule uses SQL to check if the type of user is 'Bot' or if the user's login ends in '[bot]', and if so, it
+declares it as a bot. This is applied to PR authors, reviewers, and commit authors. Missing values for user do not count
+as bots, and this was written once as a macro so the rule will remain constant across models and such. These bots are
+excluded from the marts and first-review timing as they're automated, so using them as metrics wouldn't make much sense.
+The first review also excludes the pull request author's own reviews (since it's literally them who made it).
+
+I also added new key columns because dbt uses single column key relationships/tests and some pull request numbers exist
+in multiple repos, so it uses a combination of the repo and the number. I chose this over the `dbt_utils` package, which
+would add a download step to every clean run. The timezone is manually set to UTC so there are no issues with timezones
+being user-specific and changing data (otherwise events near a month boundary could be counted in the wrong month), and
+run time is calculated by the maximum of the `fetched_at` in the raw tables so rebuilds with no new data gives the same
+results (idempotency).
+
+Open pull requests are kept in `fct_pull_requests` setting `is_open` to true and `merged_at` and `closed_at` staying
+NULL because they're still actively being worked on. They're never dropped or given a fake close date, so
+`hours_to_merge` and `hours_to_close` are NULL for them too. I used medians rather than means because the durations are
+right-skewed (some pull requests have been open for years which pulls the mean way up above the typical pull request).
+Since median skips NULL values, open pull requests drop out of the time-to-merge median and unreviewed ones drop out of
+the time-to-first-review median, so they are instead addressed in `pct_open_stale` (open PRs) and
+`pct_reviewed_within_7d` (unreviewed PRs count as not reviewed).
+
+There are 24 tests, ultimately boiling down to a few simple things: checking for unique and non-null values in
+identifier columns, checking that each review actually belongs to a pull request stored (`relationships`), checking
+that pull requests and reviews have accepted values for their state (open, closed, etc.), and singular tests that are
+more unique to the situation. The singular tests check that a pull request wasn't closed/merged before it was created
+(since this is impossible) and that no review was submitted before the pull request was created (also impossible).
+Each of these tests return the rows that don't pass said test, so passing the test means it returns zero rows.
+
+### dbt build results
+
+Latest flow run (`logs/transform.log` and dbt's summary line from `logs/dbt.log`), 8 models and 24 tests:
+
+```
+PASS    test  relationships_stg_pr_reviews_pr_key__pr_key__ref_stg_pull_requests_
+PASS    test  assert_pr_closed_after_created
+PASS    test  assert_review_after_pr_created
+Done. PASS=32 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=32
+```
 
 ## Task 4: Validation
 
-<!--
-Fill in after Task 4: outlier cutoffs, which records were flagged, and whether you kept,
-capped, or dropped them and why. Descriptive statistics summary.
--->
-
 ## Task 5: Health scoring and ranking
-
-<!--
-Fill in after Task 5: each metric's definition and direction (higher or lower is healthier),
-at least 4 metrics across 3 dimensions, your weights and the reasoning behind them, final ranking table.
--->
 
 ## Task 6: Plots
 
-<!--
-Fill in after Task 6: embed each PNG from plots/ and write a one-paragraph interpretation of each.
--->
-
 ## Extended items
-
-<!--
-Fill in only for the extended items you attempt (GraphQL, concurrent fetching,
-scheduled deployment, API odometer).
--->

@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw GitHub API records loaded by Task 2 (pipeline/load.py). One row per record; the full record is in payload."
+    schema: main
+    tables:
+      - name: raw_commits
+        description: "One row per commit (GET /repos/{r}/commits), keyed by (repo, sha)."
+      - name: raw_pull_requests
+        description: "One row per pull request (GET /repos/{r}/pulls), keyed by (repo, number)."
+      - name: raw_pr_reviews
+        description: "One row per PR review (GET /repos/{r}/pulls/{number}/reviews), keyed by (repo, review id)."
+      - name: raw_releases
+        description: "One row per release (GET /repos/{r}/releases), keyed by (repo, release id)."

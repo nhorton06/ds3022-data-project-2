@@ -1,0 +1,118 @@
+version: 2
+
+# Bot rule (macros/is_bot.sql), applied to PR authors, reviewers, and commit authors:
+#   is_bot = user.type = 'Bot' OR user.login LIKE '%[bot]'
+# A missing user (e.g. a commit email not linked to a GitHub account) is not a bot.
+
+models:
+  - name: stg_commits
+    description: "One row per commit in the window, latest fetch per (repo, sha)."
+    columns:
+      - name: repo
+        description: "Repository as owner/name."
+      - name: sha
+        description: "Commit SHA (natural key)."
+      - name: commit_key
+        description: "Primary key: repo || '#' || sha."
+        data_tests:
+          - unique
+          - not_null
+      - name: author_login
+        description: "GitHub login of the commit author; NULL when the commit email isn't linked to an account."
+      - name: is_bot
+        description: "Bot rule: author.type = 'Bot' OR author.login LIKE '%[bot]'. False when author_login is NULL."
+      - name: committed_at
+        description: "commit.author.date, UTC."
+      - name: fetched_at
+        description: "When the landing page holding this record was fetched."
+
+  - name: stg_pull_requests
+    description: "One row per pull request (open or closed), latest fetch per (repo, number)."
+    columns:
+      - name: repo
+        description: "Repository as owner/name."
+      - name: number
+        description: "PR number (natural key, unique only within a repo)."
+      - name: pr_key
+        description: "Primary key: repo || '#' || number."
+        data_tests:
+          - unique
+          - not_null
+      - name: author_login
+        description: "GitHub login of the PR author."
+      - name: is_bot
+        description: "Bot rule: user.type = 'Bot' OR user.login LIKE '%[bot]'."
+      - name: state
+        description: "GitHub state: open or closed (merged PRs are closed)."
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed']
+      - name: created_at
+        description: "When the PR was opened, UTC."
+      - name: updated_at
+        description: "Last activity on the PR, UTC."
+      - name: closed_at
+        description: "When the PR was closed (merged or not), UTC; NULL while open."
+      - name: merged_at
+        description: "When the PR was merged, UTC; NULL unless merged."
+      - name: fetched_at
+        description: "When the landing page holding this record was fetched."
+
+  - name: stg_pr_reviews
+    description: "One row per submitted PR review, latest fetch per (repo, review id). PENDING reviews are dropped."
+    columns:
+      - name: repo
+        description: "Repository as owner/name."
+      - name: id
+        description: "Review id (natural key)."
+      - name: review_key
+        description: "Primary key: repo || '#' || id."
+        data_tests:
+          - unique
+          - not_null
+      - name: pr_number
+        description: "PR number, parsed from the trailing number of pull_request_url."
+      - name: pr_key
+        description: "Foreign key to stg_pull_requests: repo || '#' || pr_number."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_pull_requests')
+                field: pr_key
+      - name: reviewer_login
+        description: "GitHub login of the reviewer; NULL for deleted accounts."
+      - name: is_bot
+        description: "Bot rule: user.type = 'Bot' OR user.login LIKE '%[bot]'."
+      - name: state
+        description: "Review outcome."
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']
+      - name: submitted_at
+        description: "When the review was submitted, UTC."
+      - name: fetched_at
+        description: "When the landing page holding this record was fetched."
+
+  - name: stg_releases
+    description: "One row per published release (all time, drafts dropped), latest fetch per (repo, release id)."
+    columns:
+      - name: repo
+        description: "Repository as owner/name."
+      - name: id
+        description: "Release id (natural key)."
+      - name: release_key
+        description: "Primary key: repo || '#' || id."
+        data_tests:
+          - unique
+          - not_null
+      - name: tag_name
+        description: "Git tag of the release, e.g. v2.1.0."
+      - name: published_at
+        description: "When the release was published, UTC."
+      - name: prerelease
+        description: "True for release candidates, betas, etc."
+      - name: fetched_at
+        description: "When the landing page holding this record was fetched."

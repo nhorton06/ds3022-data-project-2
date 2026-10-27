@@ -4,4 +4,6 @@ package_health:
       type: duckdb
       path: packages.duckdb
       threads: 1
+      settings:
+        TimeZone: 'UTC'  # GitHub timestamps are UTC; keeps date_trunc('month', ...) from shifting to local time
   target: dev

@@ -37,3 +37,7 @@ class TaskLogger:
     def warning(self, msg):
         self.prefect.warning(msg)
         self.file.warning(msg)
+
+    def error(self, msg):
+        self.prefect.error(msg)
+        self.file.error(msg)

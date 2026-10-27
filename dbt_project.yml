@@ -12,16 +12,17 @@ clean-targets:         # directories to be removed by `dbt clean`
   - "target"
   - "dbt_packages"
 
+# Shared values used by the models
+vars:
+  window_start: '2024-01-01'
+
 # Configuring models
 # Full documentation: https://docs.getdbt.com/docs/configuring-models
-
-# In this example config, we tell dbt to build all models in the example/
-# directory as views. These settings can be overridden in the individual model
-# files using the `{{ config(...) }}` macro.
-
-# include additional dirs as needed below, not just "example"
 models:
   package_health:
-    # Config indicated by + and applies to all files under models/example/
-    example:
+    # Staging models are thin cleanups of the raw tables, so views (always current, no storage)
+    staging:
       +materialized: view
+    # Marts are read repeatedly by Tasks 4-6, so build them once as tables
+    marts:
+      +materialized: table

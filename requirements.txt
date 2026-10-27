@@ -1,5 +1,6 @@
 dbt-core
 dbt-duckdb
+prefect-dbt
 prefect==3.9.0
 httpx
 matplotlib

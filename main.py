@@ -4,6 +4,7 @@ from pipeline.common import REPOS, WINDOW_START
 from pipeline.extract import extract
 from pipeline.load import load
 from pipeline.transform import dbt_build
+from pipeline.validate import validate
 
 
 @flow(name="package-health")
@@ -12,6 +13,7 @@ def package_health_flow(repos: list[str] | None = None, window_start: str = WIND
     extract(repos, window_start)
     load()
     dbt_build()
+    validate()
 
 
 if __name__ == "__main__":

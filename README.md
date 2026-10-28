@@ -224,6 +224,73 @@ Done. PASS=32 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=32
 
 ## Task 4: Validation
 
+Task 4's code is stored in the `validate.py` file within the `pipeline` folder and the `validate()` task, running
+directly after `dbt_build()` in `main.py`. It uses plain Python and SQL queries on `packages.duckdb` and reads the
+landed JSON files in `data/raw/`, not running dbt at all. It logs to Prefect and the `validate.log` file under the
+`logs` folder. Completeness failures raise errors and fail the flow entirely. All failures are first collected and
+marked so one run shows all the problems at once. Outliers and stats don't raise errors as they are simply information.
+
+I was going to have the connection be read-only for this task, but the dbt connection from task 3 makes it so the
+connection is kept open for the same file in the Python process and DuckDB won't allow a second connection be made in
+the same process with differing settings. The task just runs SELECT statements, so it's not altering the data in any
+way, but it isn't just in read-only mode for the aforementioned reason.
+
+Task 4 is unique in that it is checking the entire pipeline and describing the data. All the completeness checks
+passed, and every distinct record (repo and id) in the landed files was checked against its raw table, and there were
+no missing records for any repo/endpoint. To check the raw to staging step, we count the rows in the raw tables against
+the rows in the staging. The difference must be equal to the staging drops row count, and all of them did during the
+run of this. It also checks that each repo has at least one commit in every complete month (not the current month).
+
+For detecting outliers, the cutoff for time to merge is one year after opening. It's the same rule for each repo as it
+is a nice round number and also is a clear marker for atypical merge times since the median times were from 4.9 to 61
+hours, far less than an entire year. I considered a Tukey fence (Q3 + 3xIQR) for merge times too, but the times are so
+right-skewed that it flagged about 12% of numpy's pull requests, which is just the normal long tail, not real outliers.
+It flagged 16 pull requests: 4 in networkx, 6 in numpy, and 6 in statsmodels, ranging from just over a year (networkx #7347,
+365 days) to about two and a half years (numpy #26214, 907 days). All 6 statsmodels ones were merged within the
+same three weeks in August 2026.
+
+For weekly commits, the cutoff was 3xIQR beyond the third quartile per repo. It is done per repo because a normal week
+for each of these repositories is VERY different from one another (medians of 44 for numpy vs 5 for networkx). I
+initially tried 1.5xIQR, but this flagged 28 weeks which was most ordinary busy weeks for given repositories, but 3xIQR
+actually started marking real bursts of commits, so I stuck with that. This new rule flagged 12 weeks: 1 in networkx
+(29 commits the week of July 1, 2024, against a cutoff of 23), 1 in numpy (166 commits the week of October 13, 2025,
+against 152), and 10 in statsmodels, all between June and October 2026 (55 to 361 commits against a cutoff of 50). The
+statsmodels weeks come from a surge of activity in mid-2026, mostly from one maintainer, and that surge also explains
+its merge-time outliers: those old pull requests were finally merged during it. This surge is also what drives
+statsmodels' high commit trend in Task 5.
+
+The decided way to handle these was to keep them, not cap or drop anything, as these are real outliers for pull
+requests that did eventually get merged. The percentiles and medians barely move from keeping them and dropping them
+would be hiding data that is actually meaningful and demonstrate the slow behavior we're looking to judge/measure with
+health metrics. Bursts of commits are very real patterns in GitHub repositories as one of the only consistent things in
+a given repository is inconsistency when it comes to commits and additions, and they're real human work (bot commits
+were already excluded), not data errors.
+
+### Descriptive statistics
+
+The descriptive statistics use medians and 90th percentiles because the durations are heavily right-skewed (the 90th
+percentile is 15 to 150 times the median). numpy responds fastest (half of its reviewed pull requests get a first review
+within 7.5 hours), and statsmodels merges fastest (median 4.9 hours), but statsmodels' slowest 10% of reviewed pull
+requests wait about 20 days for a first review. networkx is the slowest to merge (median 61 hours; the slowest 10% take over 47 days).
+
+| Repo | Median first review | p90 first review | Median merge | p90 merge | Commits/week | Releases/year |
+| --- | --- | --- | --- | --- | --- | --- |
+| networkx/networkx | 12.5 h | 257.5 h | 61.0 h | 1,128.7 h | 6.0 | 4.6 |
+| numpy/numpy | 7.5 h | 166.0 h | 7.7 h | 269.5 h | 49.6 | 14.9 |
+| statsmodels/statsmodels | 14.5 h | 490.0 h | 4.9 h | 307.5 h | 20.9 | 2.1 |
+
+### Evidence
+
+From `logs/validate.log` (latest run):
+
+```
+numpy/numpy pulls: 5828 raw rows, 0 dropped on purpose, 5828 in stg_pull_requests
+Commits in every complete month: checked 33 months per repo, 0 empty
+All completeness checks passed
+Time-to-merge outliers (merged > 8760 h = 1 year after opening): 16 PRs, kept
+Weekly-commit outliers (above Q3 + 3 x IQR per repo): 12 weeks, kept
+```
+
 ## Task 5: Health scoring and ranking
 
 ## Task 6: Plots

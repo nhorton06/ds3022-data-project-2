@@ -293,6 +293,75 @@ Weekly-commit outliers (above Q3 + 3 x IQR per repo): 12 weeks, kept
 
 ## Task 5: Health scoring and ranking
 
+Task 5's code is in the `model.py` file and the `model_health()` task in the flow, running directly after `validate()`
+in `main.py`. It reads the health inputs, scores, ranks, and then prints/logs to Prefect and the `model.log` file. It
+then writes the ranked table it created to a table, `health_scores`, in `packages.duckdb` using SQL (CREATE OR
+REPLACE). All the decisions made are within one dictionary (DIMENSIONS), providing the metric itself, its weight, and
+whether it being higher or lower is healthier.
+
+I used 6 metrics, one per dimension, which keeps it so that each subscore is just the metric's score, so each weight
+maps very easily to the measurement. I decided to use `commit_trend_pct` for activity trend, `pct_reviewed_within_7d`
+for responsiveness, `median_hours_to_merge` for throughput, `pct_open_stale` for backlog, `releases_per_year` for
+release cadence, and `bus_factor` for contributor base. The other metrics I had before were removed from the health
+inputs mart.
+
+### Metric definitions and directions
+
+| Dimension | Metric | Definition | Healthier when | networkx | numpy | statsmodels |
+| --- | --- | --- | --- | --- | --- | --- |
+| Activity (trend) | `commit_trend_pct` | Monthly commit regression slope over complete months divided by the repo's average month (% change per month) | Higher | +0.08% | −1.12% | +9.50% |
+| Responsiveness | `pct_reviewed_within_7d` | Share of PRs (at least 7 days old) first reviewed by someone other than the author or a bot within a week. Never-reviewed PRs count as not reviewed | Higher | 72% | 38% | 13% |
+| Throughput | `median_hours_to_merge` | Median hours from a PR being opened to being merged (merged PRs only) | Lower | 61.0 h | 7.7 h | 4.9 h |
+| Backlog | `pct_open_stale` | Share of open PRs with no activity in 180 days or more | Lower | 59% | 34% | 41% |
+| Release cadence | `releases_per_year` | Releases in the window divided by the window's length in years | Higher | 4.6 | 14.9 | 2.1 |
+| Contributor base | `bus_factor` | Fewest PR authors who collectively account for at least half of merged PRs | Higher | 4 | 3 | 1 |
+
+For normalization, I decided to just not use `commits_per_week` as a metric because it's a raw volume thing, so numpy
+would win just by being bigger (it has about 8x networkx's commits), and `ASSESSING-HEALTH.md` ranks raw volume last
+as a vanity metric, so it stays as just a stat to look at, not a metric. Each metric that is scored is scaled with
+min-max scaling, putting them all on a 0 to 1 scale, so the worst gets a 0, the best gets a 1, and the middle repo gets
+some scale between the two, which demonstrates the distance between each repo. All the metrics are some percentage,
+median, rate, % change, or small headcount, so bigger repos won't just score high purely because they're bigger,
+which is helpful here since the size of each repo varies a LOT.
+
+For scoring, the min-max scaling is used, but also for metrics that are better when lower such as
+`median_hours_to_merge` or `pct_open_stale`, it is flipped with 1 - x so the lowest value gets a score of 1 and the
+highest gets a score of 0, just to keep everything when scored on the scale of higher being better for ranking/scoring.
+
+For weights, I followed the order of importance that `ASSESSING-HEALTH.md` lists health signals in, and gave
+decreasing weights down that list, as the order made sense to me and I didn't particularly see any need to change
+it. Responsiveness is definitely one of, if not the, best metrics for repo health because it shows that there
+are people within the repo that are active in the community AND responding to other users. Contributor base is also
+good because it can show how spread out the work is (which is typically a good sign) and not just relying on one or two
+people to keep it alive (so these two metrics got 25% and 20% weight, respectively). From there, the weights just
+decreased as things like activity and throughput are important, but are less important than the other metrics
+mentioned previously, so activity trend, release cadence, and backlog get 15% each, and throughput gets 10%.
+
+The final score is calculated by multiplying each subscore by its weight, adding those up, and multiplying by 100 to
+give it a 0-100 scale. The code makes sure the weights sum up to 1 or will flag this and not continue further as the
+weights not summing to 1 would mean a repo's max score is no longer 100 and the scale is all off.
+
+For analyzing trends, `commit_trend_pct` calculates a regression slope over the complete months from 2024 to
+present, divided by the repo's average month so it's a % change and normalized to the size. There was a surge in
+2026 for statsmodels, but I didn't alter it or get rid of it as this is a real mark of human work and shouldn't be
+discarded or altered just because it's strange or doesn't fit a perfect pattern.
+
+When messing with the weights, 2nd and 3rd place can swap around. For example, using equal weights for each metric
+makes it so statsmodels is 2nd and networkx is 3rd, but the weights I use have them flipped due to the emphasis more on
+responsiveness and bus factor. Regardless, numpy takes 1st place in pretty much every configuration (although I'm sure
+there's some configuration you could use to swap that, but the rational ones all seem to put numpy in 1st).
+
+### Ranking
+
+Latest run (`logs/model.log`), also written to the `health_scores` table in `packages.duckdb`. Subscores are 0-1 (1 =
+healthiest of the three, before weighting), score is 0-100.
+
+| Rank | Repo | Score | Responsiveness (25%) | Contributor base (20%) | Activity trend (15%) | Release cadence (15%) | Backlog (15%) | Throughput (10%) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | numpy/numpy | 63.4 | 0.42 | 0.67 | 0.00 | 1.00 | 1.00 | 0.95 |
+| 2 | networkx/networkx | 49.6 | 1.00 | 1.00 | 0.11 | 0.19 | 0.00 | 0.00 |
+| 3 | statsmodels/statsmodels | 35.7 | 0.00 | 0.00 | 1.00 | 0.00 | 0.72 | 1.00 |
+
 ## Task 6: Plots
 
 ## Extended items

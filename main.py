@@ -3,6 +3,7 @@ from prefect import flow
 from pipeline.common import REPOS, WINDOW_START
 from pipeline.extract import extract
 from pipeline.load import load
+from pipeline.model import model_health
 from pipeline.transform import dbt_build
 from pipeline.validate import validate
 
@@ -14,6 +15,7 @@ def package_health_flow(repos: list[str] | None = None, window_start: str = WIND
     load()
     dbt_build()
     validate()
+    model_health()
 
 
 if __name__ == "__main__":

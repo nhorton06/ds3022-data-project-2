@@ -1,4 +1,5 @@
--- One row per repo, one column per health metric scored in Task 5.
+-- One row per repo, one column per health metric scored in Task 5 (one metric per dimension), plus
+-- commits_per_week, which Task 4 reports but Task 5 does not score (it rewards size, not health).
 -- Every column is a rate, share, median, slope, or headcount, never a raw volume total.
 -- Bot-authored PRs and commits are excluded (see mart_repo_monthly).
 with window_info as (
@@ -19,11 +20,9 @@ human_prs as (
 pr_metrics as (
     select
         repo,
-        median(hours_to_first_review) as median_hours_to_first_review,
         -- only PRs old enough to have had a full 7 days to be reviewed
         avg(reviewed_within_7d::INT)
             filter (where created_at <= (select run_time from window_info) - interval 7 day) as pct_reviewed_within_7d,
-        sum(is_merged::INT) / nullif(sum(is_merged::INT) + sum(is_closed_unmerged::INT), 0) as merge_rate,
         median(hours_to_merge) as median_hours_to_merge,
         avg(is_stale::INT) filter (where is_open) as pct_open_stale
     from human_prs
@@ -79,9 +78,7 @@ select
     r.repo,
     c.commits_per_week,
     c.commit_trend_pct,
-    p.median_hours_to_first_review,
     p.pct_reviewed_within_7d,
-    p.merge_rate,
     p.median_hours_to_merge,
     p.pct_open_stale,
     coalesce(rel.releases_per_year, 0) as releases_per_year,

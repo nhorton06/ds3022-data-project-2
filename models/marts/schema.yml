@@ -113,7 +113,7 @@ models:
         description: "True for the run month, which is not complete yet."
 
   - name: mart_health_inputs
-    description: "One row per repo, one column per health metric scored in Task 5. Every column is a rate, share, median, slope, or headcount, never a raw volume total. Bot-authored PRs and commits are excluded."
+    description: "One row per repo, one column per health metric scored in Task 5 (one per dimension), plus commits_per_week (descriptive only). Every column is a rate, share, median, slope, or headcount, never a raw volume total. Bot-authored PRs and commits are excluded."
     columns:
       - name: repo
         description: "Repository as owner/name (primary key)."
@@ -121,15 +121,11 @@ models:
           - unique
           - not_null
       - name: commits_per_week
-        description: "Activity. Commits in the window / (days in window / 7). Higher is healthier."
+        description: "Descriptive only, not scored (raw volume rewards project size). Commits in the window / (days in window / 7). Used by Task 4."
       - name: commit_trend_pct
         description: "Activity trend. regr_slope(commits, month_index) over complete months divided by the average monthly commits: relative change per month (0.01 = +1%/month). Higher is healthier."
-      - name: median_hours_to_first_review
-        description: "Responsiveness. Median hours from PR creation to first non-author, non-bot review, over reviewed PRs. Lower is healthier."
       - name: pct_reviewed_within_7d
-        description: "Responsiveness. Share of PRs (created at least 7 days before run time) first reviewed within 7 days. Higher is healthier."
-      - name: merge_rate
-        description: "Throughput. Merged / (merged + closed unmerged) over PRs created in the window. Higher is healthier."
+        description: "Responsiveness. Share of PRs (created at least 7 days before run time) first reviewed within 7 days; never-reviewed PRs count as not reviewed. Higher is healthier."
       - name: median_hours_to_merge
         description: "Throughput. Median hours from creation to merge, over merged PRs. Lower is healthier."
       - name: pct_open_stale

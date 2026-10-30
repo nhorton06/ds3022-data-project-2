@@ -421,3 +421,23 @@ doesn't clearly indicate a higher merge ratio, but the differences between each 
 the graph as previously explained.
 
 ## Extended items
+
+
+I only attempted the odometer item, and I implemented it by counting each request sent to the GitHub API in a
+flow run and logging the total. This is done in `extract.py` using a counter that increases by 1 within `github_get()`, which
+is the one function that every single API call goes through, so it doesn't need to be anywhere else. `extract()` resets it
+back to 0 at the beginning of each run and logs it at the end of said run. Task 1 is the only task that calls the API, so
+that number from task 1 is the entire flow's total. Every response like rate-limited, server errors, network issues, requests lost when Prefect retries a task,
+etc. are all still requests to the API but don't save a page, so counting in the place that each of these things go
+through is the easiest way to still keep track of them all, rather than adding up the saved pages afterward, which
+would miss them. It does have a limitation that since it's
+just a simple Python variable, if you were to attempt to fetch different repos at the same time, it would need a mechanism
+to lock it so they don't both update it at the same time and cause issues.
+
+### Evidence
+
+The two numbers match when nothing fails or retries. Any difference would be the failed or retried requests.
+
+```
+API odometer: 150 requests this flow run (150 pages saved)
+```

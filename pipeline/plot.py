@@ -70,7 +70,9 @@ def plot_dimension_profile(scores):
     """Small multiples: one panel per repo in rank order, one bar per scored dimension. Returns the PNG path."""
     dimensions = list(DIMENSIONS)
     labels = [f"{dim.replace('_', ' ').capitalize()} ({DIMENSIONS[dim][2]:.0%})" for dim in dimensions]
-    fig, axes = plt.subplots(1, len(scores), figsize=(15, 4.8), sharex=True, sharey=True)
+    # squeeze=False always returns a grid of panels, even for a single repo, so [0] is the row of panels
+    fig, axes = plt.subplots(1, len(scores), figsize=(15, 4.8), sharex=True, sharey=True, squeeze=False)
+    axes = axes[0]
     for ax, row in zip(axes, scores.itertuples()):
         values = [getattr(row, dim) for dim in dimensions]
         ax.barh(labels, values, color=REPO_COLORS[row.repo], height=0.6)

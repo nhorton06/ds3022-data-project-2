@@ -364,4 +364,53 @@ healthiest of the three, before weighting), score is 0-100.
 
 ## Task 6: Plots
 
+Task 6's code is in `plot.py` within the pipeline and the `plot()` task. It's the last task in the flow, following
+`model_health()`. It reads the health scores from the previous task and the monthly repo mart, saves 3 plots as
+PNGs using matplotlib, and logs to Prefect and `plot.log` in the `logs` folder. It uses consistent colors as
+requested in the rubric, networkx being blue, numpy being orange, and statsmodels being green. It assigns these colors
+alphabetically so the repo's color won't change or depend on the rank or anything like that, just the name (which
+obviously won't change), and uses these same colors in all 3 plots. I tried to use original units whenever possible,
+but the log scale for the bubble chart's x axis and the two hours panels in the trends chart multiplies by 10x each
+tick, and it still shows the tick values in just hours.
+
+![Dimension profile](plots/dimension_profile.png)
+
+This small-multiples bar chart keeps each panel to one repo per, with the left being the healthiest and decreasing
+as it moves right. The title shows the repo, rank, and overall score. It has one bar per health metric/dimension as
+well as its subscore and weight displayed in the labels. Each repo has a different shape with numpy being the overall
+strongest, but not simply winning in every category. You can see that networkx leads on contributor base and
+responsiveness but is the worst on backlog and throughput. Statsmodels is pretty much the opposite with having the
+fastest throughput and best trend, but the worst responsiveness, contributor base, and release cadence. Numpy wins
+here since its only 0 is the activity trend while the other two packages have huge holes in their performance
+(which could suggest smaller projects are less consistent, though with only three repos, it's mainly just a guess/assumption
+more than anything).
+
+![Monthly trends](plots/monthly_trends.png)
+
+This trends chart shows a panel per metric, with one line within each per repo. It runs from the beginning of the
+window to present (Jan 2024 to current), shows the current partial month, and excludes all bot contributions. We can
+quickly see statsmodels surge in 2026 very sharply, especially visible in the commits and PRs opened graphs. Numpy
+grows steadily across the board on active contributors and PRs opened and shows pretty stable consistency on the
+other charts. Networkx is also pretty stable across the board with the exception of merge ratio as it declines
+steadily over the past couple years, starting around 0.9 and going down to about 0.4-0.6 in 2026 (the current
+partial month dips to about 0.25, but that month isn't complete yet). This again shows the potential trend that
+larger repos like numpy can grow while staying steady, while statsmodels' swings come from having only a few PRs per
+month.
+
+![Review speed vs. merge ratio](plots/review_vs_merge.png)
+
+This bubble chart plots review speed against merge ratio, including the repo as the color, active contributors as the
+bubble size, and having one bubble per month within each repo (excluding the current/incomplete month). The x axis is
+median hours to the first review (log scale), and the y axis is the merge ratio. This measures 4 different variables
+all in one plot. Numpy's bubbles are a far more tight cluster while networkx and statsmodels spread out. Obviously,
+the bubbles for numpy are also larger as it is a larger repo, and statsmodels has the smallest subset of bubbles on
+average (fewest contributors active). Numpy's tight cluster shows a fast review combined with a high merge ratio
+(ranging from about 0.7 to 0.95). Networkx sits lower on the graph with a similar review speed to numpy, but lower
+merge ratios (even going down to about 0.35 at the lowest). Statsmodels is extremely spread out on both axes,
+ranging in merge ratio from about 0.4 to 1.0, and ranging in first review time from under an hour all the way up to
+about 10,000 hours. It has far fewer contributors and reviewed PRs per month, so each month's median relies on just a
+few PRs and is bound to be more inconsistent and very scattered given its size. Within each repo, a faster review
+doesn't clearly indicate a higher merge ratio, but the differences between each repo are very clear just looking at
+the graph as previously explained.
+
 ## Extended items

@@ -34,11 +34,18 @@ export GH_PAT=<your token>
 
 ## Running the flow
 
+
 The flow can be run by executing the command `python main.py` or `time python main.py` to include the time metrics for
-running the flow itself on top of the outputs the pipeline already provides. The expected runtime for the first full run for
-task 1 is a little over an hour (about 65 minutes or so, but it can slightly vary depending on when the flow is run during
-the cycle of rate-limit resets of the hour and such). Task 1 writes to the `data/raw` folder and later tasks will write to
-`packages.duckdb` and the `plots/` folder, and all tasks log to the `logs/` folder.
+running the flow itself on top of the outputs the pipeline already provides. This runs one Prefect flow with all 6
+tasks in order (extract, load, dbt build, validate, model, and plot), and if any task fails, the flow stops. The
+expected runtime for the first full run is a little over an hour (about 65 minutes or so, but it can slightly vary
+depending on when the flow is run during the cycle of rate-limit resets of the hour and such). Almost all of that is
+task 1, since it makes about 7,950 API requests, which is more than the 5,000 per hour limit, so it sleeps for about 20
+minutes partway through depending on when you start the flow. The other five tasks take under a minute combined. Later runs are incremental and only take
+about 30-60 seconds since they only fetch what changed since the last run. If a run gets interrupted, running it again
+just resumes and skips the pages already saved. Task 1 writes to the `data/raw` folder and later tasks will write to
+`packages.duckdb` and the `plots/` folder, and all tasks log to the `logs/` folder. Logs and runs also show up in the
+Prefect UI if `PREFECT_API_URL` points to an actual Prefect server.
 
 ## Task 1: Extract
 

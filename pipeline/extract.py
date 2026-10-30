@@ -18,6 +18,10 @@ PER_PAGE = 100
 RATE_LIMIT_BUFFER = 10  # sleep until reset once this few requests remain
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
+# API odometer: every request sent to GitHub in this flow run, counted in github_get() (the one function all
+# requests go through), so rate-limited, failed, and retried requests count too. Reset at the start of extract().
+api_requests = 0
+
 
 class RetryableHTTPError(Exception):
     """A failure that should clear up on its own (rate limit, 5xx, network)."""
@@ -50,6 +54,8 @@ def make_client():
 
 def github_get(client, url, log):
     """GET one page. Returns (json body, next page url or None)."""
+    global api_requests
+    api_requests += 1  # counted before the response is checked, so failures count too
     try:
         resp = client.get(url)
     except httpx.TransportError as exc:
@@ -147,7 +153,7 @@ def repo_dir(repo):
 
 @task(retries=5, retry_delay_seconds=exponential_backoff(backoff_factor=10), retry_condition_fn=is_retryable)
 def extract_endpoint(repo, endpoint, since):
-    """Fetch commits, pulls, or releases for one repo. Returns API requests made."""
+    """Fetch commits, pulls, or releases for one repo. Returns pages fetched from the API."""
     log = TaskLogger("extract")
     urls = {
         "commits": f"{API}/repos/{repo}/commits?since={since}&per_page={PER_PAGE}",
@@ -201,7 +207,9 @@ def load_watermarks():
 
 @task
 def extract(repos, window_start):
-    """Task 1: land every page of every endpoint for each repo. Returns total API requests."""
+    """Task 1: land every page of every endpoint for each repo. Returns the API odometer (total requests)."""
+    global api_requests
+    api_requests = 0
     log = TaskLogger("extract")
     if LOADED_MARKER.exists():
         log.info("Found _LOADED: previous data is in DuckDB, deleting data/raw/ and fetching only new records")
@@ -213,15 +221,16 @@ def extract(repos, window_start):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     watermarks = load_watermarks()
-    requests = 0
+    pages = 0
     for repo in repos:
         commits_since = watermarks.get((repo, "commits"), window_start)
         pulls_since = watermarks.get((repo, "pulls"), window_start)
         log.info(f"{repo}: commits since {commits_since}, pulls since {pulls_since}")
-        requests += extract_endpoint(repo, "commits", commits_since)
-        requests += extract_endpoint(repo, "pulls", pulls_since)
-        requests += extract_reviews(repo, window_start, pulls_since)
-        requests += extract_endpoint(repo, "releases", window_start)
+        pages += extract_endpoint(repo, "commits", commits_since)
+        pages += extract_endpoint(repo, "pulls", pulls_since)
+        pages += extract_reviews(repo, window_start, pulls_since)
+        pages += extract_endpoint(repo, "releases", window_start)
 
-    log.info(f"Extract finished: {requests} API requests this run")
-    return requests
+    log.info(f"Extract finished: {pages} pages fetched from the API")
+    log.info(f"API odometer: {api_requests} requests this flow run ({pages} pages saved)")
+    return api_requests

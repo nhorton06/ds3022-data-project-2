@@ -109,6 +109,23 @@ Resumed run:
 17:50:02 | INFO    | Extract finished: 7501 API requests this run
 ```
 
+### GraphQL resume
+
+I also tested resuming with the GraphQL version. I killed the run about 70 seconds in, after 15 of numpy's 59 GraphQL pull
+request pages were saved, and no half-written files were left over. The next run skipped the pages already saved and
+continued numpy from the cursor saved in page 15, so it only needed 48 requests. The final row counts matched a fresh full
+run exactly. With concurrent fetching, interrupting the script/flow with ctrl+c stops the main task, but a repo thread
+already running finishes the current step it's on before the program actually exits, so it can take an extra minute or 2
+to actually fully stop.
+
+```
+No _LOADED marker: resuming, pages already in data/raw/ will be skipped
+networkx/networkx pulls + pr_reviews (GraphQL): 1500 PRs, 5011 reviews, 0 queries, 15 pages already on disk
+numpy/numpy commits: 7736 records, 0 pages fetched, 78 pages already on disk
+numpy/numpy pulls + pr_reviews (GraphQL): 5900 PRs, 12785 reviews, 44 queries, 15 pages already on disk
+API odometer: 48 requests this flow run (REST 2, GraphQL 46, GraphQL points 46; 46 pages saved)
+```
+
 ### Rate limit and request counts
 
 The resumed run hit the 5000 requests limit for the hour and slept until the reset. (This is shown in the warning above).

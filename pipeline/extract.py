@@ -106,10 +106,24 @@ def is_retryable(task, task_run, state):
     return False
 
 
-def make_client():
+GH_SECRET_BLOCK = os.environ.get("GH_SECRET_BLOCK", "dxx6gu-pat")
+
+
+def get_token():
+    """The GitHub token: the GH_PAT environment variable locally, or the Prefect Secret block on the deployment."""
     token = os.environ.get("GH_PAT")
-    if not token:
-        raise RuntimeError("GH_PAT environment variable is not set")
+    if token:
+        return token
+    try:
+        from prefect.blocks.system import Secret
+
+        return Secret.load(GH_SECRET_BLOCK).get()
+    except Exception as exc:
+        raise RuntimeError(f"GH_PAT is not set and Prefect Secret block '{GH_SECRET_BLOCK}' could not be loaded") from exc
+
+
+def make_client():
+    token = get_token()
     return httpx.Client(
         headers={
             "Authorization": f"Bearer {token}",

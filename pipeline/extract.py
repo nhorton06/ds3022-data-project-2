@@ -14,13 +14,50 @@ from prefect.tasks import exponential_backoff
 from pipeline.common import DB_PATH, LOADED_MARKER, RAW_DIR, TaskLogger
 
 API = "https://api.github.com"
+GRAPHQL_URL = f"{API}/graphql"
 PER_PAGE = 100
-RATE_LIMIT_BUFFER = 10  # sleep until reset once this few requests remain
+RATE_LIMIT_BUFFER = 10  # sleep until reset once this few requests (or GraphQL points) remain
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-# API odometer: every request sent to GitHub in this flow run, counted in github_get() (the one function all
-# requests go through), so rate-limited, failed, and retried requests count too. Reset at the start of extract().
-api_requests = 0
+# API odometer: every request sent to GitHub in this flow run, counted in send() (the one function all requests
+# go through), so rate-limited, failed, and retried requests count too. Reset at the start of extract().
+odometer = {"rest": 0, "graphql": 0, "graphql_points": 0}
+
+# One query returns 100 PRs with up to 100 reviews each (replacing ~100 REST review calls), sorted by most
+# recently updated so paging can stop at the window start / watermark like the REST version.
+PULLS_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number state createdAt updatedAt closedAt mergedAt
+        author { __typename login }
+        reviews(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { databaseId state submittedAt author { __typename login } }
+        }
+      }
+    }
+  }
+}
+"""
+
+# Follow-up query for the rare PR with more than 100 reviews
+MORE_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId state submittedAt author { __typename login } }
+      }
+    }
+  }
+}
+"""
 
 
 class RetryableHTTPError(Exception):
@@ -52,12 +89,11 @@ def make_client():
     )
 
 
-def github_get(client, url, log):
-    """GET one page. Returns (json body, next page url or None)."""
-    global api_requests
-    api_requests += 1  # counted before the response is checked, so failures count too
+def send(client, method, url, log, api, **kwargs):
+    """Send one request to the REST or GraphQL API and apply every rate-limit and error rule. Returns (resp, body)."""
+    odometer[api] += 1  # counted before the response is checked, so failures count too
     try:
-        resp = client.get(url)
+        resp = client.request(method, url, **kwargs)
     except httpx.TransportError as exc:
         raise RetryableHTTPError(f"Network error for {url}: {exc}") from exc
 
@@ -89,10 +125,37 @@ def github_get(client, url, log):
 
     if remaining <= RATE_LIMIT_BUFFER:
         wait = reset - time.time() + 5
-        log.warning(f"{remaining} requests left in this hour; sleeping {wait:.0f}s until reset")
+        log.warning(f"{remaining} {api} requests/points left in this hour; sleeping {wait:.0f}s until reset")
         time.sleep(max(wait, 0))
 
+    return resp, data
+
+
+def github_get(client, url, log):
+    """GET one REST page. Returns (json body, next page url or None)."""
+    resp, data = send(client, "GET", url, log, "rest")
     return data, resp.links.get("next", {}).get("url")
+
+
+def graphql_post(client, query, variables, log):
+    """Run one GraphQL query and track the point budget from its rateLimit field. Returns the data object."""
+    _, body = send(client, "POST", GRAPHQL_URL, log, "graphql", json={"query": query, "variables": variables})
+    errors = body.get("errors") or []
+    if any(error.get("type") == "RATE_LIMITED" for error in errors):
+        log.warning("GraphQL rate limited; sleeping 60s before retry")
+        time.sleep(60)
+        raise RetryableHTTPError("GraphQL rate limited")
+    if errors:
+        raise RuntimeError(f"GraphQL errors for {variables}: {[e.get('message') for e in errors]}")
+
+    rate = body["data"]["rateLimit"]
+    odometer["graphql_points"] += rate["cost"]
+    if rate["remaining"] <= RATE_LIMIT_BUFFER:
+        reset = datetime.strptime(rate["resetAt"], TS_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+        wait = reset - time.time() + 5
+        log.warning(f"{rate['remaining']} GraphQL points left; sleeping {wait:.0f}s until reset")
+        time.sleep(max(wait, 0))
+    return body["data"]
 
 
 def read_page(path):
@@ -151,6 +214,101 @@ def repo_dir(repo):
     return RAW_DIR / repo.replace("/", "__")
 
 
+def rest_user(author):
+    """GraphQL author -> REST user shape. REST bot logins end in [bot]; GraphQL's don't, so add it back."""
+    if author is None:
+        return None
+    is_bot = author["__typename"] == "Bot"
+    return {"login": author["login"] + ("[bot]" if is_bot else ""), "type": "Bot" if is_bot else "User"}
+
+
+def rest_pr(node):
+    """GraphQL PR -> the REST fields the pipeline uses, so Task 2 and dbt work unchanged."""
+    return {
+        "number": node["number"],
+        "state": "open" if node["state"] == "OPEN" else "closed",  # REST has no MERGED state; merged_at says it
+        "created_at": node["createdAt"],
+        "updated_at": node["updatedAt"],
+        "closed_at": node["closedAt"],
+        "merged_at": node["mergedAt"],
+        "user": rest_user(node["author"]),
+    }
+
+
+def rest_reviews(nodes, repo, number):
+    """GraphQL reviews -> REST review shape, including the pull_request_url staging parses the PR number from."""
+    return [
+        {
+            "id": node["databaseId"],
+            "state": node["state"],
+            "submitted_at": node["submittedAt"],
+            "user": rest_user(node["author"]),
+            "pull_request_url": f"{API}/repos/{repo}/pulls/{number}",
+        }
+        for node in nodes
+        if node["databaseId"] is not None
+    ]
+
+
+def fetch_more_reviews(client, log, repo, number, cursor, folder):
+    """Page through reviews past the first 100 for one PR, landing pr_<number>_page_0002.json onward."""
+    owner, name = repo.split("/")
+    page_num = 2
+    while cursor:
+        data = graphql_post(client, MORE_REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
+                                                         "cursor": cursor}, log)
+        conn = data["repository"]["pullRequest"]["reviews"]
+        cursor = conn["pageInfo"]["endCursor"] if conn["pageInfo"]["hasNextPage"] else None
+        write_page(folder / f"pr_{number}_page_{page_num:04d}.json", {
+            "repo": repo, "endpoint": "pr_reviews", "api": "graphql", "url": GRAPHQL_URL, "page": page_num,
+            "fetched_at": datetime.now(timezone.utc).strftime(TS_FORMAT), "data": rest_reviews(conn["nodes"], repo, number),
+        })
+        page_num += 1
+
+
+def fetch_pulls_graphql(client, log, repo, stop_before):
+    """Cursor-paginate PRs (newest updated first) with their reviews, landing one pulls file and one reviews file
+    per response page. Skips pages already on disk and stops once a page ends before stop_before.
+    Returns (PRs, reviews, queries sent, pages skipped from disk).
+    """
+    owner, name = repo.split("/")
+    pulls_dir, reviews_dir = repo_dir(repo) / "pulls", repo_dir(repo) / "pr_reviews"
+    pulls_dir.mkdir(parents=True, exist_ok=True)
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    cursor, page_num, prs, reviews, fetched, skipped = None, 1, 0, 0, 0, 0
+    while True:
+        pulls_path = pulls_dir / f"page_{page_num:04d}.json"
+        reviews_path = reviews_dir / f"page_{page_num:04d}.json"
+        page, review_page = read_page(pulls_path), read_page(reviews_path)
+        if page is None or review_page is None or page.get("api") != "graphql":
+            data = graphql_post(client, PULLS_QUERY, {"owner": owner, "name": name, "cursor": cursor}, log)
+            conn = data["repository"]["pullRequests"]
+            review_records = []
+            for node in conn["nodes"]:
+                review_records += rest_reviews(node["reviews"]["nodes"], repo, node["number"])
+                if node["reviews"]["pageInfo"]["hasNextPage"]:
+                    fetch_more_reviews(client, log, repo, node["number"], node["reviews"]["pageInfo"]["endCursor"],
+                                       reviews_dir)
+            meta = {"repo": repo, "api": "graphql", "url": GRAPHQL_URL, "cursor": cursor, "page": page_num,
+                    "fetched_at": datetime.now(timezone.utc).strftime(TS_FORMAT)}
+            next_cursor = conn["pageInfo"]["endCursor"] if conn["pageInfo"]["hasNextPage"] else None
+            review_page = {**meta, "endpoint": "pr_reviews", "data": review_records}
+            page = {**meta, "endpoint": "pulls", "next_cursor": next_cursor, "data": [rest_pr(n) for n in conn["nodes"]]}
+            write_page(reviews_path, review_page)  # pulls file last: if it exists, its reviews page does too
+            write_page(pulls_path, page)
+            fetched += 1
+        else:
+            skipped += 1
+
+        prs += len(page["data"])
+        reviews += len(review_page["data"])
+        cursor = page["next_cursor"]
+        if cursor is None or (stop_before and page["data"] and page["data"][-1]["updated_at"] < stop_before):
+            break
+        page_num += 1
+    return prs, reviews, fetched, skipped
+
+
 @task(retries=5, retry_delay_seconds=exponential_backoff(backoff_factor=10), retry_condition_fn=is_retryable)
 def extract_endpoint(repo, endpoint, since):
     """Fetch commits, pulls, or releases for one repo. Returns pages fetched from the API."""
@@ -193,6 +351,17 @@ def extract_reviews(repo, window_start, since):
     return fetched
 
 
+@task(retries=5, retry_delay_seconds=exponential_backoff(backoff_factor=10), retry_condition_fn=is_retryable)
+def extract_pulls_graphql(repo, since):
+    """Fetch PRs and their reviews for one repo through GraphQL. Returns queries sent."""
+    log = TaskLogger("extract")
+    with make_client() as client:
+        prs, reviews, fetched, skipped = fetch_pulls_graphql(client, log, repo, since)
+    log.info(f"{repo} pulls + pr_reviews (GraphQL): {prs} PRs, {reviews} reviews, "
+             f"{fetched} queries, {skipped} pages already on disk")
+    return fetched
+
+
 def load_watermarks():
     """Read {(repo, endpoint): newest updated_at} from _load_state, or {} before the first load."""
     if not DB_PATH.exists():
@@ -206,10 +375,11 @@ def load_watermarks():
 
 
 @task
-def extract(repos, window_start):
-    """Task 1: land every page of every endpoint for each repo. Returns the API odometer (total requests)."""
-    global api_requests
-    api_requests = 0
+def extract(repos, window_start, pr_source="graphql"):
+    """Task 1: land every page of every endpoint for each repo. PRs and reviews come from GraphQL by default
+    (pr_source="rest" uses the original REST calls). Returns the API odometer (total requests)."""
+    odometer.update(rest=0, graphql=0, graphql_points=0)
+    started = time.monotonic()
     log = TaskLogger("extract")
     if LOADED_MARKER.exists():
         log.info("Found _LOADED: previous data is in DuckDB, deleting data/raw/ and fetching only new records")
@@ -227,10 +397,15 @@ def extract(repos, window_start):
         pulls_since = watermarks.get((repo, "pulls"), window_start)
         log.info(f"{repo}: commits since {commits_since}, pulls since {pulls_since}")
         pages += extract_endpoint(repo, "commits", commits_since)
-        pages += extract_endpoint(repo, "pulls", pulls_since)
-        pages += extract_reviews(repo, window_start, pulls_since)
+        if pr_source == "graphql":
+            pages += extract_pulls_graphql(repo, pulls_since)
+        else:
+            pages += extract_endpoint(repo, "pulls", pulls_since)
+            pages += extract_reviews(repo, window_start, pulls_since)
         pages += extract_endpoint(repo, "releases", window_start)
 
-    log.info(f"Extract finished: {pages} pages fetched from the API")
-    log.info(f"API odometer: {api_requests} requests this flow run ({pages} pages saved)")
-    return api_requests
+    total = odometer["rest"] + odometer["graphql"]
+    log.info(f"Extract finished ({pr_source} for PRs/reviews): {pages} pages fetched in {time.monotonic() - started:.0f}s")
+    log.info(f"API odometer: {total} requests this flow run (REST {odometer['rest']}, GraphQL {odometer['graphql']}, "
+             f"GraphQL points {odometer['graphql_points']}; {pages} pages saved)")
+    return total

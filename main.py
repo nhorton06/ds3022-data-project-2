@@ -10,9 +10,9 @@ from pipeline.validate import validate
 
 
 @flow(name="package-health")
-def package_health_flow(repos: list[str] | None = None, window_start: str = WINDOW_START):
+def package_health_flow(repos: list[str] | None = None, window_start: str = WINDOW_START, pr_source: str = "graphql"):
     repos = repos or REPOS
-    extract(repos, window_start)
+    extract(repos, window_start, pr_source)
     load()
     dbt_build()
     validate()

@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -21,7 +22,37 @@ TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # API odometer: every request sent to GitHub in this flow run, counted in send() (the one function all requests
 # go through), so rate-limited, failed, and retried requests count too. Reset at the start of extract().
+# The lock keeps the counts right when repos are fetched in parallel threads.
 odometer = {"rest": 0, "graphql": 0, "graphql_points": 0}
+odometer_lock = threading.Lock()
+
+
+def count(key, amount=1):
+    with odometer_lock:
+        odometer[key] += amount
+
+
+class RateLimiter:
+    """One shared limiter per API for all parallel threads: when any thread sees the budget running low (or gets
+    rate limited), it sets a pause, and every thread waits for it before its next request."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.paused_until = 0.0
+
+    def pause_until(self, timestamp):
+        with self.lock:
+            self.paused_until = max(self.paused_until, timestamp)
+
+    def wait(self, log, api):
+        with self.lock:
+            wait = self.paused_until - time.time()
+        if wait > 0:
+            log.warning(f"{api} rate limit pause: sleeping {wait:.0f}s")
+            time.sleep(wait)
+
+
+limiters = {"rest": RateLimiter(), "graphql": RateLimiter()}
 
 # One query returns 100 PRs with up to 100 reviews each (replacing ~100 REST review calls), sorted by most
 # recently updated so paging can stop at the window start / watermark like the REST version.
@@ -91,7 +122,8 @@ def make_client():
 
 def send(client, method, url, log, api, **kwargs):
     """Send one request to the REST or GraphQL API and apply every rate-limit and error rule. Returns (resp, body)."""
-    odometer[api] += 1  # counted before the response is checked, so failures count too
+    limiters[api].wait(log, api)  # respect a pause set by any thread
+    count(api)  # counted before the response is checked, so failures count too
     try:
         resp = client.request(method, url, **kwargs)
     except httpx.TransportError as exc:
@@ -109,8 +141,9 @@ def send(client, method, url, log, api, **kwargs):
             wait = 60  # GitHub says to wait at least a minute when no header is given
         else:
             raise RuntimeError(f"403 Forbidden for {url}: {resp.text[:200]}")
-        log.warning(f"Rate limited ({resp.status_code}) on {url}; sleeping {wait:.0f}s before retry")
-        time.sleep(max(wait, 0))
+        log.warning(f"Rate limited ({resp.status_code}) on {url}; pausing all {api} requests {wait:.0f}s, then retrying")
+        limiters[api].pause_until(time.time() + wait)
+        limiters[api].wait(log, api)
         raise RetryableHTTPError(f"Rate limited on {url}")
 
     if resp.status_code >= 500:
@@ -124,9 +157,8 @@ def send(client, method, url, log, api, **kwargs):
         raise RetryableHTTPError(f"Could not parse JSON from {url}") from exc
 
     if remaining <= RATE_LIMIT_BUFFER:
-        wait = reset - time.time() + 5
-        log.warning(f"{remaining} {api} requests/points left in this hour; sleeping {wait:.0f}s until reset")
-        time.sleep(max(wait, 0))
+        log.warning(f"{remaining} {api} requests/points left in this hour; pausing all {api} requests until reset")
+        limiters[api].pause_until(reset + 5)
 
     return resp, data
 
@@ -142,19 +174,19 @@ def graphql_post(client, query, variables, log):
     _, body = send(client, "POST", GRAPHQL_URL, log, "graphql", json={"query": query, "variables": variables})
     errors = body.get("errors") or []
     if any(error.get("type") == "RATE_LIMITED" for error in errors):
-        log.warning("GraphQL rate limited; sleeping 60s before retry")
-        time.sleep(60)
+        log.warning("GraphQL rate limited; pausing all GraphQL requests 60s, then retrying")
+        limiters["graphql"].pause_until(time.time() + 60)
+        limiters["graphql"].wait(log, "graphql")
         raise RetryableHTTPError("GraphQL rate limited")
     if errors:
         raise RuntimeError(f"GraphQL errors for {variables}: {[e.get('message') for e in errors]}")
 
     rate = body["data"]["rateLimit"]
-    odometer["graphql_points"] += rate["cost"]
+    count("graphql_points", rate["cost"])
     if rate["remaining"] <= RATE_LIMIT_BUFFER:
         reset = datetime.strptime(rate["resetAt"], TS_FORMAT).replace(tzinfo=timezone.utc).timestamp()
-        wait = reset - time.time() + 5
-        log.warning(f"{rate['remaining']} GraphQL points left; sleeping {wait:.0f}s until reset")
-        time.sleep(max(wait, 0))
+        log.warning(f"{rate['remaining']} GraphQL points left; pausing all GraphQL requests until reset")
+        limiters["graphql"].pause_until(reset + 5)
     return body["data"]
 
 
@@ -375,6 +407,21 @@ def load_watermarks():
 
 
 @task
+def extract_repo(repo, window_start, commits_since, pulls_since, pr_source):
+    """All endpoints for one repo, in order (reviews need the PR pages). Runs in parallel with the other repos."""
+    log = TaskLogger("extract")
+    log.info(f"{repo}: commits since {commits_since}, pulls since {pulls_since}")
+    pages = extract_endpoint(repo, "commits", commits_since)
+    if pr_source == "graphql":
+        pages += extract_pulls_graphql(repo, pulls_since)
+    else:
+        pages += extract_endpoint(repo, "pulls", pulls_since)
+        pages += extract_reviews(repo, window_start, pulls_since)
+    pages += extract_endpoint(repo, "releases", window_start)
+    return pages
+
+
+@task
 def extract(repos, window_start, pr_source="graphql"):
     """Task 1: land every page of every endpoint for each repo. PRs and reviews come from GraphQL by default
     (pr_source="rest" uses the original REST calls). Returns the API odometer (total requests)."""
@@ -391,18 +438,14 @@ def extract(repos, window_start, pr_source="graphql"):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     watermarks = load_watermarks()
-    pages = 0
-    for repo in repos:
-        commits_since = watermarks.get((repo, "commits"), window_start)
-        pulls_since = watermarks.get((repo, "pulls"), window_start)
-        log.info(f"{repo}: commits since {commits_since}, pulls since {pulls_since}")
-        pages += extract_endpoint(repo, "commits", commits_since)
-        if pr_source == "graphql":
-            pages += extract_pulls_graphql(repo, pulls_since)
-        else:
-            pages += extract_endpoint(repo, "pulls", pulls_since)
-            pages += extract_reviews(repo, window_start, pulls_since)
-        pages += extract_endpoint(repo, "releases", window_start)
+    # Concurrent fetching: submit every repo at once (Prefect runs them in parallel threads); the shared
+    # limiters and the odometer lock keep the combined usage under the quota and the counts right.
+    futures = [
+        extract_repo.submit(repo, window_start, watermarks.get((repo, "commits"), window_start),
+                            watermarks.get((repo, "pulls"), window_start), pr_source)
+        for repo in repos
+    ]
+    pages = sum(future.result() for future in futures)
 
     total = odometer["rest"] + odometer["graphql"]
     log.info(f"Extract finished ({pr_source} for PRs/reviews): {pages} pages fetched in {time.monotonic() - started:.0f}s")

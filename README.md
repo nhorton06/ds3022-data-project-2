@@ -37,12 +37,15 @@ export GH_PAT=<your token>
 
 The flow can be run by executing the command `python main.py` or `time python main.py` to include the time metrics for
 running the flow itself on top of the outputs the pipeline already provides. This runs one Prefect flow with all 6
-tasks in order (extract, load, dbt build, validate, model, and plot), and if any task fails, the flow stops. The
-expected runtime for the first full run is a little over an hour (about 65 minutes or so, but it can slightly vary
-depending on when the flow is run during the cycle of rate-limit resets of the hour and such). Almost all of that is
-task 1, since it makes about 7,950 API requests, which is more than the 5,000 per hour limit, so it sleeps for about 20
-minutes partway through depending on when you start the flow. The other five tasks take under a minute combined. Later runs are incremental and only take
-about 30-60 seconds since they only fetch what changed since the last run. If a run gets interrupted, running it again
+tasks in order (extract, load, dbt build, validate, model, and plot), and if any task fails, the flow stops. By
+default, pull requests and reviews are fetched with GraphQL (see Extended items), so the expected runtime for the first
+full run is about 3.5 minutes (214 API requests, about 2.5 minutes of that in task 1). With the original REST version
+(`package_health_flow(pr_source="rest")`), the first full run is a little over an hour (about 65 minutes or so, but it
+can slightly vary depending on when the flow is run during the cycle of rate-limit resets of the hour and such). Almost
+all of that is task 1, since it makes about 7,950 API requests, which is more than the 5,000 per hour limit, so it
+sleeps for about 20 minutes partway through depending on when you start the flow. The other five tasks take under a
+minute combined. Later runs are incremental and only take about 30-60 seconds since they only fetch what changed since
+the last run. If a run gets interrupted, running it again
 just resumes and skips the pages already saved. Task 1 writes to the `data/raw` folder and later tasks will write to
 `packages.duckdb` and the `plots/` folder, and all tasks log to the `logs/` folder. Logs and runs also show up in the
 Prefect UI if `PREFECT_API_URL` points to an actual Prefect server.
@@ -67,6 +70,11 @@ with a base backoff of 10 seconds, doubling with each retry. Other errors, such 
 retrying wouldn't really help or do much for these. For resumability, pages that are already saved on the disk
 are skipped, so the saved `next_url` will provide a checkpoint where to continue from in the case of interruptions and/or
 errors. Pages are written to a temp (.tmp) file before being renamed so a crash never leaves pages unfinished.
+
+Everything above describes the REST version, which still exists in the code and runs when called with `pr_source="rest"`,
+but by default, the flow now uses GraphQL to fetch pull requests and reviews rather than REST. Commits and releases still
+continue to use REST with the same pagination, rate limit, retry, and resume handling. The record counts and the
+interrupted/resumed run below are from the REST version.
 
 ### Record counts
 
@@ -249,7 +257,7 @@ the rows in the staging. The difference must be equal to the staging drops row c
 run of this. It also checks that each repo has at least one commit in every complete month (not the current month).
 
 For detecting outliers, the cutoff for time to merge is one year after opening. It's the same rule for each repo as it
-is a nice round number and also is a clear marker for atypical merge times since the median times were from 4.9 to 61
+is a nice round number and also is a clear marker for atypical merge times since the median times were from about 5 to 61
 hours, far less than an entire year. I considered a Tukey fence (Q3 + 3xIQR) for merge times too, but the times are so
 right-skewed that it flagged about 12% of numpy's pull requests, which is just the normal long tail, not real outliers.
 It flagged 16 pull requests: 4 in networkx, 6 in numpy, and 6 in statsmodels, ranging from just over a year (networkx #7347,
@@ -261,7 +269,7 @@ for each of these repositories is VERY different from one another (medians of 44
 initially tried 1.5xIQR, but this flagged 28 weeks which was most ordinary busy weeks for given repositories, but 3xIQR
 actually started marking real bursts of commits, so I stuck with that. This new rule flagged 12 weeks: 1 in networkx
 (29 commits the week of July 1, 2024, against a cutoff of 23), 1 in numpy (166 commits the week of October 13, 2025,
-against 152), and 10 in statsmodels, all between June and October 2026 (55 to 361 commits against a cutoff of 50). The
+against 152), and 10 in statsmodels, all between July and October 2026 (91 to 363 commits against a cutoff of 58). The
 statsmodels weeks come from a surge of activity in mid-2026, mostly from one maintainer, and that surge also explains
 its merge-time outliers: those old pull requests were finally merged during it. This surge is also what drives
 statsmodels' high commit trend in Task 5.
@@ -276,23 +284,23 @@ were already excluded), not data errors.
 ### Descriptive statistics
 
 The descriptive statistics use medians and 90th percentiles because the durations are heavily right-skewed (the 90th
-percentile is 15 to 150 times the median). numpy responds fastest (half of its reviewed pull requests get a first review
-within 7.5 hours), and statsmodels merges fastest (median 4.9 hours), but statsmodels' slowest 10% of reviewed pull
-requests wait about 20 days for a first review. networkx is the slowest to merge (median 61 hours; the slowest 10% take over 47 days).
+percentile is about 20 to 60 times the median). numpy responds fastest (half of its reviewed pull requests get a first review
+within 7.5 hours), and statsmodels merges fastest (median 5 hours), but statsmodels' slowest 10% of reviewed pull
+requests wait about 20 days for a first review. networkx is the slowest to merge (median 61 hours; the slowest 10% take about 47 days).
 
 | Repo | Median first review | p90 first review | Median merge | p90 merge | Commits/week | Releases/year |
 | --- | --- | --- | --- | --- | --- | --- |
-| networkx/networkx | 12.5 h | 257.5 h | 61.0 h | 1,128.7 h | 6.0 | 4.6 |
-| numpy/numpy | 7.5 h | 166.0 h | 7.7 h | 269.5 h | 49.6 | 14.9 |
-| statsmodels/statsmodels | 14.5 h | 490.0 h | 4.9 h | 307.5 h | 20.9 | 2.1 |
+| networkx/networkx | 12.6 h | 252.6 h | 60.9 h | 1,128.2 h | 5.9 | 4.6 |
+| numpy/numpy | 7.5 h | 170.1 h | 7.8 h | 276.8 h | 49.4 | 14.8 |
+| statsmodels/statsmodels | 14.5 h | 486.8 h | 5.0 h | 286.0 h | 22.2 | 2.1 |
 
 ### Evidence
 
 From `logs/validate.log` (latest run):
 
 ```
-numpy/numpy pulls: 5828 raw rows, 0 dropped on purpose, 5828 in stg_pull_requests
-Commits in every complete month: checked 33 months per repo, 0 empty
+numpy/numpy pulls: 5900 raw rows, 0 dropped on purpose, 5900 in stg_pull_requests
+Commits in every complete month: checked 34 months per repo, 0 empty
 All completeness checks passed
 Time-to-merge outliers (merged > 8760 h = 1 year after opening): 16 PRs, kept
 Weekly-commit outliers (above Q3 + 3 x IQR per repo): 12 weeks, kept
@@ -316,11 +324,11 @@ inputs mart.
 
 | Dimension | Metric | Definition | Healthier when | networkx | numpy | statsmodels |
 | --- | --- | --- | --- | --- | --- | --- |
-| Activity (trend) | `commit_trend_pct` | Monthly commit regression slope over complete months divided by the repo's average month (% change per month) | Higher | +0.08% | −1.12% | +9.50% |
+| Activity (trend) | `commit_trend_pct` | Monthly commit regression slope over complete months divided by the repo's average month (% change per month) | Higher | −0.31% | −1.01% | +10.85% |
 | Responsiveness | `pct_reviewed_within_7d` | Share of PRs (at least 7 days old) first reviewed by someone other than the author or a bot within a week. Never-reviewed PRs count as not reviewed | Higher | 72% | 38% | 13% |
-| Throughput | `median_hours_to_merge` | Median hours from a PR being opened to being merged (merged PRs only) | Lower | 61.0 h | 7.7 h | 4.9 h |
-| Backlog | `pct_open_stale` | Share of open PRs with no activity in 180 days or more | Lower | 59% | 34% | 41% |
-| Release cadence | `releases_per_year` | Releases in the window divided by the window's length in years | Higher | 4.6 | 14.9 | 2.1 |
+| Throughput | `median_hours_to_merge` | Median hours from a PR being opened to being merged (merged PRs only) | Lower | 60.9 h | 7.8 h | 5.0 h |
+| Backlog | `pct_open_stale` | Share of open PRs with no activity in 180 days or more | Lower | 59% | 31% | 53% |
+| Release cadence | `releases_per_year` | Releases in the window divided by the window's length in years | Higher | 4.6 | 14.8 | 2.1 |
 | Contributor base | `bus_factor` | Fewest PR authors who collectively account for at least half of merged PRs | Higher | 4 | 3 | 1 |
 
 For normalization, I decided to just not use `commits_per_week` as a metric because it's a raw volume thing, so numpy
@@ -353,9 +361,10 @@ present, divided by the repo's average month so it's a % change and normalized t
 2026 for statsmodels, but I didn't alter it or get rid of it as this is a real mark of human work and shouldn't be
 discarded or altered just because it's strange or doesn't fit a perfect pattern.
 
-When messing with the weights, 2nd and 3rd place can swap around. For example, using equal weights for each metric
-makes it so statsmodels is 2nd and networkx is 3rd, but the weights I use have them flipped due to the emphasis more on
-responsiveness and bus factor. Regardless, numpy takes 1st place in pretty much every configuration (although I'm sure
+When messing with the weights, 2nd and 3rd place get very close. For example, using equal weights for each metric
+gives networkx 37.6 and statsmodels 36.6, only a point apart, while the weights I used put networkx well ahead (48.8 vs 27.9)
+due to the emphasis more on responsiveness and bus factor. (On an earlier run, equal weights actually swapped them, so
+2nd and 3rd depend on weights and on small changes in the data.) Regardless, numpy takes 1st place in pretty much every configuration (although I'm sure
 there's some configuration you could use to swap that, but the rational ones all seem to put numpy in 1st).
 
 ### Ranking
@@ -366,8 +375,8 @@ healthiest of the three, before weighting), score is 0-100.
 | Rank | Repo | Score | Responsiveness (25%) | Contributor base (20%) | Activity trend (15%) | Release cadence (15%) | Backlog (15%) | Throughput (10%) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | numpy/numpy | 63.4 | 0.42 | 0.67 | 0.00 | 1.00 | 1.00 | 0.95 |
-| 2 | networkx/networkx | 49.6 | 1.00 | 1.00 | 0.11 | 0.19 | 0.00 | 0.00 |
-| 3 | statsmodels/statsmodels | 35.7 | 0.00 | 0.00 | 1.00 | 0.00 | 0.72 | 1.00 |
+| 2 | networkx/networkx | 48.8 | 1.00 | 1.00 | 0.06 | 0.19 | 0.00 | 0.00 |
+| 3 | statsmodels/statsmodels | 27.9 | 0.00 | 0.00 | 1.00 | 0.00 | 0.20 | 1.00 |
 
 ## Task 6: Plots
 
@@ -399,8 +408,8 @@ window to present (Jan 2024 to current), shows the current partial month, and ex
 quickly see statsmodels surge in 2026 very sharply, especially visible in the commits and PRs opened graphs. Numpy
 grows steadily across the board on active contributors and PRs opened and shows pretty stable consistency on the
 other charts. Networkx is also pretty stable across the board with the exception of merge ratio as it declines
-steadily over the past couple years, starting around 0.9 and going down to about 0.4-0.6 in 2026 (the current
-partial month dips to about 0.25, but that month isn't complete yet). This again shows the potential trend that
+steadily over the past couple years, starting around 0.9 and going down to about 0.5-0.7 in most of 2026, with lows
+of about 0.37 in July and 0.29 in October (the current partial month, November, only has a few days so far). This again shows the potential trend that
 larger repos like numpy can grow while staying steady, while statsmodels' swings come from having only a few PRs per
 month.
 
@@ -413,7 +422,7 @@ all in one plot. Numpy's bubbles are a far more tight cluster while networkx and
 the bubbles for numpy are also larger as it is a larger repo, and statsmodels has the smallest subset of bubbles on
 average (fewest contributors active). Numpy's tight cluster shows a fast review combined with a high merge ratio
 (ranging from about 0.7 to 0.95). Networkx sits lower on the graph with a similar review speed to numpy, but lower
-merge ratios (even going down to about 0.35 at the lowest). Statsmodels is extremely spread out on both axes,
+merge ratios (even going down to about 0.3 at the lowest). Statsmodels is extremely spread out on both axes,
 ranging in merge ratio from about 0.4 to 1.0, and ranging in first review time from under an hour all the way up to
 about 10,000 hours. It has far fewer contributors and reviewed PRs per month, so each month's median relies on just a
 few PRs and is bound to be more inconsistent and very scattered given its size. Within each repo, a faster review
@@ -423,21 +432,64 @@ the graph as previously explained.
 ## Extended items
 
 
-I only attempted the odometer item, and I implemented it by counting each request sent to the GitHub API in a
-flow run and logging the total. This is done in `extract.py` using a counter that increases by 1 within `github_get()`, which
-is the one function that every single API call goes through, so it doesn't need to be anywhere else. `extract()` resets it
+I attempted all 4 extended items: GraphQL ingestion, concurrent fetching, scheduled deployment, and the API
+odometer.
+
+### GraphQL ingestion
+
+Pull requests and reviews are fetched with GitHub's GraphQL API by default now (`fetch_pulls_graphql()` within `extract.py`).
+One query returns 100 pull requests, newest updated first, showing up to 100 reviews for each one, replacing about 100 REST
+review calls. It pages with cursors, stops at the window start or watermark just like the REST version does, and tracks the
+5000 point hourly budget from the `rateLimit` field of each query (stopping before hitting 0). The rare pull request with
+over 100 reviews gets follow-up queries to handle it. Each result is converted into the same shape as the REST records and
+saved in the same folders, so task 2, the dbt models, and tests work the same. Commits and releases still use REST and the
+REST version for the pull requests and reviews still works with `pr_source="rest"` as previously mentioned.
+
+| Full first run (empty `data/` and database) | API requests | Task 1 runtime | Whole flow |
+| --- | --- | --- | --- |
+| REST (Oct 23) | about 7,950 | about 65 min (including a ~22 min rate-limit sleep) | about 65 min |
+| GraphQL + concurrency (Nov 3) | 214 (126 REST + 88 GraphQL, 88 points) | 164 s | 3 min 34 s |
+
+```
+Extract finished (graphql for PRs/reviews): 212 pages fetched in 164s
+API odometer: 214 requests this flow run (REST 126, GraphQL 88, GraphQL points 88; 212 pages saved)
+```
+
+### Concurrent fetching
+
+The 3 repos are fetched at the same time. `extract()` submits one `extract_repo` task per repo with Prefect's
+`.submit()`, so they run in parallel threads. A shared `RateLimiter` per API (REST and GraphQL) keeps the total usage
+under the quota. When any thread sees the budget running low or gets rate limited, it pauses and every thread
+waits for it to resume before its next request. The odometer also uses a lock so parallel threads can't miscount. In the
+logs, all 3 repos start within the same second.
+
+### Scheduled deployment
+
+`deploy.py` registers a Prefect deployment on the SDS server (`uvasds-k8s-pool`) that runs on the 28th each month. It
+clones this private repo with a Prefect "Secret" block, and the flow reads its GitHub token from said block on the server.
+`DEPLOYMENTS.md` has the deploy command and the full log of a run I triggered from the UI on Prefect (finished in ~3m). The
+server starts every run from an empty folder, so each scheduled run counts as a full first run.
+
+### API odometer
+
+I implemented it by counting each request sent to the GitHub API in a
+flow run and logging the total. This is done in `extract.py` using a counter that increases by 1 within `send()`, which
+is the one function that every single API call goes through (REST and GraphQL), so it doesn't need to be anywhere else. `extract()` resets it
 back to 0 at the beginning of each run and logs it at the end of said run. Task 1 is the only task that calls the API, so
 that number from task 1 is the entire flow's total. Every response like rate-limited, server errors, network issues, requests lost when Prefect retries a task,
 etc. are all still requests to the API but don't save a page, so counting in the place that each of these things go
 through is the easiest way to still keep track of them all, rather than adding up the saved pages afterward, which
-would miss them. It does have a limitation that since it's
-just a simple Python variable, if you were to attempt to fetch different repos at the same time, it would need a mechanism
-to lock it so they don't both update it at the same time and cause issues.
+would miss them. Since the repos are now fetched at the same time, the counter is updated under a lock so 2 different
+threads can't update it at the same time and cause any issues. It counts REST requests, GraphQL requests, and GraphQL
+points separately.
 
 ### Evidence
 
 The two numbers match when nothing fails or retries. Any difference would be the failed or retried requests.
 
 ```
-API odometer: 150 requests this flow run (150 pages saved)
+API odometer: 214 requests this flow run (REST 126, GraphQL 88, GraphQL points 88; 212 pages saved)
 ```
+
+The 214 requests vs 212 pages difference is 2 GraphQL follow-up queries for PRs with over 100 reviews, whose
+extra review pages are saved but not included in the pages count.

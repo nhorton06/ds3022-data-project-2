@@ -1,6 +1,6 @@
 # Data Project 2 // Open Source Package Health: GitHub Data Pipeline
 
-Released: Oct 23, 2026 | Due: Nov 02, 2026
+Released: Oct 23, 2026 | Due: Nov 04, 2026
 
 > **Before you submit**, work through the [submission checklist](CHECKLIST.md). It lists every deliverable and what to submit in Canvas: your repository URL, and which extended items you attempted.
 
